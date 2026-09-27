@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Chat Burst Test Client</title>
+</head>
+<body>
+  <input id="input" type="text" placeholder="메시지 입력">
+  <button onclick="sendMessage()">전송</button>
+  <ul id="messages"></ul>
+  <script>
+    const socket = new WebSocket("ws://" + location.host + "/chat");
+    socket.onopen = () => appendMessage("[connected]");
+    socket.onclose = () => appendMessage("[disconnected]");
+    socket.onmessage = (event) => appendMessage(event.data);
+    function sendMessage() {
+      const input = document.getElementById("input");
+      socket.send(input.value);
+      input.value = "";
+    }
+    function appendMessage(text) {
+      const li = document.createElement("li");
+      li.textContent = text;
+      document.getElementById("messages").appendChild(li);
+    }
+  </script>
+</body>
+</html>
