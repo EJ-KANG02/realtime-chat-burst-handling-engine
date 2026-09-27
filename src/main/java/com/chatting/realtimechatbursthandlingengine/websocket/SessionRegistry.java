@@ -25,7 +25,9 @@ public class SessionRegistry {
     public void broadcast(TextMessage message){
         for (WebSocketSession session : sessions) {
             try {
-                session.sendMessage(message);
+                synchronized (session) {
+                    session.sendMessage(message);
+                }
             } catch (IOException e) {
                 log.warn("failed to send message to session {}: {}", session.getId(), e.getMessage());
             }
