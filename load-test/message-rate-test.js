@@ -11,6 +11,7 @@ export const options = {
       executor: 'constant-vus',
       vus: Number(__ENV.VUS || 50),
       duration: __ENV.DURATION || '30s',
+      gracefulStop: '2s',
     },
   },
 };
