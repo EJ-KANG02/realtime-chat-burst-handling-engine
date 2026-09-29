@@ -140,7 +140,99 @@ CPU에 여유가 있는데도 latency가 폭발 → 스레드 대부분이 `sync
 
 ---
 
-## 다음 단계
+## Stage 3 — Bounded Queue + Backpressure 도입
 
-- Bounded queue + backpressure 정책 설계 (Stage 5)
-- 느린 클라이언트에 대한 별도 처리, 버퍼가 찼을 때 드롭 정책 (Stage 6)
+### Decision
+`ThreadPoolExecutor`를 `LinkedBlockingQueue`(무제한) 대신 `ArrayBlockingQueue`(크기 제한) + `DiscardOldestPolicy`로 구성. 큐가 꽉 차면 아직 처리 안 된 것 중 가장 오래된 전송 작업을 버리고 새 작업을 받음 ("느리게 다 보여주기"보다 "최신 것 위주로 보여주기"를 택함 — 라이브 채팅은 오래된 메시지의 가치가 빠르게 떨어진다는 판단).
+
+### Why 이 위치(egress)인가
+ingress(들어오는 지점)를 막으면 "메시지 1개→50개로 증폭"되는 구조의 본질을 안 건드리고 타이밍만 늦추는 것. 실제로 부담이 되는 자원(세션별 전송)에 직접 제한을 거는 게 egress임.
+
+### Evidence — 큐 용량별 비교 측정
+동일 조건(VUS=50, MSG_INTERVAL_MS=10ms, DURATION=30s)에서 큐 용량만 변경하며 측정. Drop count는 커스텀 `RejectedExecutionHandler`로 직접 계측 (`/stats` 엔드포인트로 노출).
+
+| 큐 용량 | latency avg | p95 | max | dropped | drop rate(추정) |
+|---|---|---|---|---|---|
+| 20 | 1.84ms | 5ms | 204ms | 5,917,169 | ~74.4% |
+| **50** | **30.25ms** | **109ms** | **526ms** | 2,867,219 | ~40.0% |
+| 100 | 495.67ms | 1.25초 | 2.04초 | 1,863,152 | ~28.1% |
+| 500 | 687.31ms | 1.51초 | 2.17초 | 1,699,645 | ~26.7% |
+
+(drop rate = dropped / (`ws_messages_sent` × 50세션), 근사치)
+
+### Analysis
+용량을 20→50→100으로 늘리면 latency는 급격히 악화(1.84ms→30ms→495ms)되는데 drop rate 개선은 완만함(74%→40%→28%). 100→500 구간은 drop rate가 거의 그대로인데 latency만 더 나빠짐 — **100 이상은 순손해.**
+
+Nielsen의 응답시간 기준(~100ms 이하=즉각적으로 체감, ~1초=지연이 뚜렷이 체감)으로 보면, 50은 p95(109ms)·max(526ms) 모두 "즉각적∼약간의 지연" 구간에 머무는 반면 100은 p95가 이미 1.25초로 "명백히 느림" 구간에 진입함.
+
+### Decision — 큐 용량 50 채택
+latency가 사람이 체감하기에 즉각적인 수준을 유지하면서, drop rate를 20 대비 절반 가까이 낮추는 지점.
+
+### 이 수치의 한계 (중요)
+이 40% drop rate는 "50개 연결이 각자 초당 100건(10ms 간격)"이라는 **인위적인 극한 조건**에서 나온 값이다. 이건 실제 사용자가 타이핑으로 낼 수 있는 속도가 아니라 시스템의 절벽 지점을 찾기 위한 스트레스 테스트 조건이며, 연결 수를 늘리고 개인당 속도를 현실적인 수준으로 낮춘 조건(Stage 4)에서는 drop rate가 달라질 수 있다 — 아직 검증 안 됨.
+
+### 참고 — 유사 업계 패턴
+- Reactive Streams / RxJava / Akka Streams의 `DROP`/`LATEST` backpressure 전략
+- WebRTC 등 실시간 영상 스트리밍의 jitter buffer (밀리느니 오래된 프레임을 버림)
+- SRE의 load shedding (감당 못 할 부하는 일부러 버려서 전체 시스템 붕괴를 막음)
+
+고정된 "정답 비율"은 없고, 목표 latency(SLO)를 먼저 정하고 그걸 만족하는 선에서 버퍼 크기를 정하는 게 일반적 접근 — 이번 실험이 그 방법론 그대로.
+
+### Next Problem
+1. Connection 수를 現실적인 규모로 늘리면서 개인당 메시지 속도는 낮추는 축(Stage 4)을 아직 측정 안 함 — 실제 TVING 트래픽 패턴에 더 가까운 조건
+2. Stage 2에서 발견한 메시지 순서 보장 문제는 여전히 미해결 (현재는 순차 처리라 발생 안 하지만, 향후 병렬화 시 재발 가능)
+
+---
+
+## 앞으로의 방향
+
+### 다음 실험 — Stage 4: Connection 수 축 측정
+Message rate는 현실적인 수준(사람이 타이핑 가능한 속도)으로 고정하고, connection 수를 점진적으로 늘려가며(예: 100 → 500 → 1,000 → ...) 어디서 병목이 생기는지 측정. 지금까지는 "50명이 비정상적으로 빠르게 보내는" 축만 봤는데, 실제 라이브 방송은 "수천~수만 명이 각자는 느리게 보내는" 형태에 가까움.
+
+### 장기 아키텍처 방향 — 단일 서버의 한계
+
+지금 구조는 **단일 JVM 프로세스의 메모리(`Set<WebSocketSession>`)에 모든 세션을 들고 있는 구조**라, 서버 한 대의 한계를 넘어서는 동시접속을 감당할 수 없다. 여러 서버로 수평 확장하려면, 서버 A에 붙은 클라이언트가 보낸 메시지를 서버 B/C에 붙은 클라이언트에게도 전달할 방법이 필요하다 — 이게 Kafka/Redis 같은 pub-sub 계층이 필요해지는 지점이다.
+
+**현재 (단일 노드):**
+```mermaid
+graph LR
+    C1[Client 1] --- WS
+    C2[Client 2] --- WS
+    C3[Client N] --- WS
+    subgraph Server["단일 Spring Boot 인스턴스"]
+        WS[ChatWebSocketHandler]
+        WS --> SR[SessionRegistry<br/>in-memory Set]
+        SR --> TP[ThreadPoolExecutor<br/>bounded queue + DiscardOldest]
+        TP --> Send[session.sendMessage]
+    end
+```
+
+**향후 (수평 확장, pub-sub 도입 후 — 아직 미구현):**
+```mermaid
+graph LR
+    C1[Client 1] --- S1
+    C2[Client 2] --- S2
+    C3[Client N] --- S3
+
+    subgraph S1["Server 1"]
+        SR1[SessionRegistry]
+    end
+    subgraph S2["Server 2"]
+        SR2[SessionRegistry]
+    end
+    subgraph S3["Server 3"]
+        SR3[SessionRegistry]
+    end
+
+    S1 <--> MQ[(Kafka / Redis Pub-Sub)]
+    S2 <--> MQ
+    S3 <--> MQ
+```
+
+이 방향은 **아직 측정된 문제가 없어서 구현하지 않는다** — 이 프로젝트의 원칙("측정된 문제가 있을 때만 기술 도입")을 그대로 유지. Stage 4에서 단일 서버의 connection 한계를 실측으로 확인하면, 그때 이 확장을 근거를 갖고 시작한다.
+
+### 정리 — 아직 안 한 것들
+- 세션별 메시지 순서 보장 (Stage 2에서 발견, 미해결)
+- Connection 수 축 부하 테스트 (Stage 4)
+- 다중 서버 확장을 위한 pub-sub 계층 (Kafka/Redis) — Stage 4 결과에 따라 필요성 재검토
+- 메시지 우선순위(공지/후원 등)에 따른 차등 delivery 정책 — 아직 근거 없음, Stage 6 원안
